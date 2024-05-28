@@ -1,122 +1,165 @@
 //Main Loop
+const INTERNAL_DBS = ["local", "config", "admin"]
 
 db = db.getSiblingDB("admin")
+const dbInfos = db.adminCommand({listDatabases:1, nameOnly: true})
+const dbNames = dbInfos.databases.filter(
+    database => !INTERNAL_DBS.includes(database.name) && !database.name.startsWith("__realm")
+).map(database => database.name);
 
-var dbInfos = db.adminCommand({listDatabases:1, nameOnly: true})
+const collectionInfos = []
+dbNames.forEach(dbName => {
+    const currentDb = db.getSiblingDB(dbName);
 
-dbNames = []
-for(d=0;d<dbInfos.databases.length;d++) {
-    dbName = dbInfos.databases[d];
-    if (dbName.name == "local" || dbName.name == "config" || dbName.name == "admin") {
-        continue;
-    }
-    dbNames.push(dbName.name)
-}
+    const dbCollections = currentDb.getCollectionInfos()
+        .filter(coll => coll.type === "collection" && !coll.name.startsWith("system."))
+        .map(coll => {
 
-collectionInfos = []
-
-for(d=0;d<dbNames.length;d++){
-    collectionNames = db.getSiblingDB(dbNames[d]).getCollectionNames();
-    
-    for(c=0;c<collectionNames.length;c++) {
-        indexesSpec = db.getSiblingDB(dbNames[d]).getCollection(collectionNames[c]).getIndexes();
-
-        indexesInfo = []
-
-        for (i=0;i<indexesSpec.length;i++){
-            indexesInfo.push({name:indexesSpec[i].name,
-            inCache:0,
-            cacheRead:0,
-            cacheWrite:0,
-            pagesUsed:0
-            })
-        }
-        collectionInfos.push({db:dbNames[d],
-            coll:collectionNames[c],
-            inCache:0,
-            cacheRead:0,
-            cacheWrite:0,
-            pagesUsed:0,
-            indexesInfo:indexesInfo
+            const indexesInfo = currentDb.getCollection(coll.name)
+                .getIndexes()
+                .map(index => {
+                    return {
+                        name: index.name,
+                        inCache: 0,
+                        cacheRead: 0,
+                        cacheWrite: 0,
+                        pagesUsed: 0
+                    }
+                });
+            
+            return {
+                db: dbName,
+                coll: coll.name,
+                inCache:0,
+                cacheRead:0,
+                cacheWrite:0,
+                pagesUsed:0,
+                indexesInfo: indexesInfo
+            }
         })
+    
+    collectionInfos.push(...dbCollections)
+})
+
+const REPORT_TIME = 60
+const MB = 1e6
+const ROWS_TO_SHOW = 30
+
+
+const getCacheStats = (stats, info) => {
+
+    const inCache = Math.floor(stats["cache"]["bytes currently in the cache"]/MB)
+    const cacheRead = Math.floor(stats["cache"]["bytes read into cache"]/MB)
+    const cacheWrite = Math.floor(stats["cache"]["bytes written from cache"]/MB)
+    const pagesUsed = Math.floor(stats["cache"]["pages requested from the cache"])
+    
+    const sizeDiff = Math.floor((inCache - info.inCache)/REPORT_TIME)
+    const readDiff = Math.floor((cacheRead - info.cacheRead)/REPORT_TIME)
+    const writeDiff = Math.floor((cacheWrite - info.cacheWrite)/REPORT_TIME)
+    const pageUseDiff = Math.floor((pagesUsed - info.pagesUsed)/REPORT_TIME)
+
+    return {
+        inCache,
+        cacheRead,
+        cacheWrite,
+        pagesUsed,
+        sizeDiff,
+        readDiff,
+        writeDiff,
+        pageUseDiff,
     }
 }
 
-reportTime = 60
 while(true){
-        print('\033[2J')
-        print( "Collection                                                           \tSize\tCached\t%age\tDelta\tRead\tWritten\tUsed")
+    const rows = [];
+    for (let collIndex = 0; collIndex < collectionInfos.length; collIndex++) {
+        const collInfo = collectionInfos[collIndex];
 
-    for(c=0;c<collectionInfos.length;c++) {
-        collInfo = collectionInfos[c]
-        db = db.getSiblingDB(collInfo.db)
-        mb = 1024*1024
-        collStats = db.getCollection(collInfo.coll).stats({scale: mb, indexDetails: true})
+        const collStats = db.getSiblingDB(collInfo.db)
+            .getCollection(collInfo.coll)
+            .stats({scale: MB, indexDetails: true})
 
-        if (collInfo.coll.startsWith('system.')) {
-            continue;
-        }
+        const {
+            inCache,
+            cacheRead,
+            cacheWrite,
+            pagesUsed,
+            sizeDiff,
+            readDiff,
+            writeDiff,
+            pageUseDiff,
+        } = getCacheStats(collStats["wiredTiger"], collInfo)
 
-        if(collStats.hasOwnProperty("codeName") && collStats["codeName"] == "CommandNotSupportedOnView"){
-            // stats not supported on view
-            continue;
-        }
+        const collSize = collStats["size"] + collStats['totalIndexSize']
 
-        inCache = Math.floor(collStats["wiredTiger"]["cache"]["bytes currently in the cache"]/mb)
-        cacheRead = Math.floor(collStats["wiredTiger"]["cache"]["bytes read into cache"]/mb)
-        cacheWrite = Math.floor(collStats["wiredTiger"]["cache"]["bytes written from cache"]/mb)
-        pagesUsed = Math.floor(collStats["wiredTiger"]["cache"]["pages requested from the cache"])
-        collSize = collStats["size"] + collStats['totalIndexSize']
-        //Compute diffs
-        sizeDiff = Math.floor((inCache - collInfo.inCache)/reportTime)
-        readDiff = Math.floor((cacheRead - collInfo.cacheRead)/reportTime)
-        writeDiff = Math.floor((cacheWrite - collInfo.cacheWrite)/reportTime)
-        pageUseDiff = Math.floor((pagesUsed - collInfo.pagesUsed)/reportTime)
-
-        name = collInfo.db + "." + collInfo.coll
-        lgth = name.length<=70?name.length:70
-        name = name + Array(70 - lgth).join(" ")
+        const namespace = `${collInfo.db}.${collInfo.coll}`;
 
         if(collSize > 0) {
-            pc = Math.floor((inCache / collSize) * 100)
-            print(  name + "\t" + collSize + "\t" +  inCache + "\t" + pc + "\t" + sizeDiff + "\t" + readDiff + "\t" + writeDiff+"\t"+pageUseDiff)
+            rows.push({
+                name: namespace,
+                size: collSize,
+                cached: inCache,
+                percentage: Math.floor((inCache / collSize) * 100),
+                delta: sizeDiff,
+                read: readDiff,
+                written: writeDiff,
+                used: pageUseDiff
+            });
         }
-        collectionInfos[c].inCache = inCache
-        collectionInfos[c].cacheRead = cacheRead
-        collectionInfos[c].cacheWrite = cacheWrite
-        collectionInfos[c].pagesUsed = pagesUsed
+
+        collectionInfos[collIndex].inCache = inCache;
+        collectionInfos[collIndex].cacheRead = cacheRead;
+        collectionInfos[collIndex].cacheWrite = cacheWrite;
+        collectionInfos[collIndex].pagesUsed = pagesUsed;
 
         // print index stats
-        for(i=0;i<collInfo.indexesInfo.length;i++){
-            indexInfo = collInfo.indexesInfo[i]
-            nameIndex = indexInfo.name
+        for (let indexIndex = 0; indexIndex < collInfo.indexesInfo.length; indexIndex++) {
+            const indexInfo = collInfo.indexesInfo[indexIndex];
+            const indexStats = collStats.indexDetails[indexInfo.name];
 
-            indexStats = collStats.indexDetails[nameIndex]
-            indexInCache = Math.floor(indexStats["cache"]["bytes currently in the cache"]/mb)
-            indexCacheRead = Math.floor(indexStats["cache"]["bytes read into cache"]/mb)
-            indexCacheWrite = Math.floor(indexStats["cache"]["bytes written from cache"]/mb)
-            indexPagesUsed = Math.floor(indexStats["cache"]["pages requested from the cache"])
-            indexSize = collStats.indexSizes[nameIndex]
-
-            //Compute diffs
-            sizeDiff = Math.floor((indexInCache - indexInfo.inCache)/reportTime)
-            readDiff = Math.floor((indexCacheRead - indexInfo.cacheRead)/reportTime)
-            writeDiff = Math.floor((indexCacheWrite - indexInfo.cacheWrite)/reportTime)
-            pageUseDiff = Math.floor((indexPagesUsed - indexInfo.pagesUsed)/reportTime)
-
-            nameTab =Array(10).join(" ") + nameIndex + Array(Math.max(0,60 - nameIndex.length)).join(" ")
+            const {
+                inCache,
+                cacheRead,
+                cacheWrite,
+                pagesUsed,
+                sizeDiff,
+                readDiff,
+                writeDiff,
+                pageUseDiff,
+            } = getCacheStats(indexStats, indexInfo)
+    
+            const indexSize = collStats.indexSizes[indexInfo.name];
 
             if(indexSize > 0) {
-                pc = Math.floor((indexInCache / indexSize) * 100)
-                print( nameTab + "\t" + indexSize + "\t" +  indexInCache + "\t" + pc + "\t" + sizeDiff + "\t" + readDiff + "\t" + writeDiff+"\t"+pageUseDiff)
+                rows.push({
+                    name: `${namespace} - IX: ${indexInfo.name}`,
+                    size: indexSize,
+                    cached: inCache,
+                    percentage: Math.floor((inCache / indexSize) * 100),
+                    delta: sizeDiff,
+                    read: readDiff,
+                    written: writeDiff,
+                    used: pageUseDiff
+                });
             }
 
-            collectionInfos[c].indexesInfo[i].inCache = indexInCache
-            collectionInfos[c].indexesInfo[i].cacheRead = indexCacheRead
-            collectionInfos[c].indexesInfo[i].cacheWrite = indexCacheWrite
-            collectionInfos[c].indexesInfo[i].pagesUsed = indexPagesUsed
+            collectionInfos[collIndex].indexesInfo[indexIndex].inCache = inCache;
+            collectionInfos[collIndex].indexesInfo[indexIndex].cacheRead = cacheRead;
+            collectionInfos[collIndex].indexesInfo[indexIndex].cacheWrite = cacheWrite;
+            collectionInfos[collIndex].indexesInfo[indexIndex].pagesUsed = pagesUsed;
         }
-    }
-    sleep(reportTime * 1000)
 
+        if(rows.length > ROWS_TO_SHOW) {
+            const topRows = rows.sort((a, b) => b.cached - a.cached).slice(0, ROWS_TO_SHOW);
+            console.clear();
+            console.table(topRows);
+        }else{
+            console.clear();
+            console.table(rows);
+        }
+
+        console.log(`Last updated at: ${new Date().toLocaleTimeString()}`);
+    }
+    console.log(`Next updated at ${new Date(Date.now() + REPORT_TIME * 1000).toLocaleTimeString()}`);
+    sleep(REPORT_TIME * 1000)
 }
